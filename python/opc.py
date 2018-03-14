@@ -15,33 +15,29 @@ Recommended use:
 
     # Test if it can connect (optional)
     if client.can_connect():
-        print('connected to %s' % ADDRESS)
+        print 'connected to %s' % ADDRESS
     else:
         # We could exit here, but instead let's just print a warning
         # and then keep trying to send pixels in case the server
         # appears later
-        print('WARNING: could not connect to %s' % ADDRESS)
+        print 'WARNING: could not connect to %s' % ADDRESS
 
     # Send pixels forever at 30 frames per second
     while True:
         my_pixels = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
         if client.put_pixels(my_pixels, channel=0):
-            print('...')
+            print '...'
         else:
-            print('not connected')
+            print 'not connected'
         time.sleep(1/30.0)
 
 """
 
 import socket
-import struct
-import sys
-
-SET_PIXEL_COLOURS = 0  # "Set pixel colours" command (see openpixelcontrol.org)
-
 
 class Client(object):
-    def __init__(self, server_ip_port, long_connection=True, verbose=False):
+
+    def __init__(self, server_ip_port=None, host=None, port=None, long_connection=True, verbose=False, gamma=(1.0,1.0,1.0)):
         """Create an OPC client object which sends pixels to an OPC server.
 
         server_ip_port should be an ip:port or hostname:port as a single string.
@@ -64,10 +60,14 @@ class Client(object):
 
         """
         self.verbose = verbose
-
+        self._udp = True
         self._long_connection = long_connection
-
-        self._ip, self._port = server_ip_port.split(':')
+        self._gamma = gamma
+        if host and port:
+            self._ip = host
+            self._port = port
+        else:
+            self._ip, self._port = server_ip_port.split(':')
         self._port = int(self._port)
 
         self._socket = None  # will be None when we're not connected
@@ -88,9 +88,13 @@ class Client(object):
 
         try:
             self._debug('_ensure_connected: trying to connect...')
-            self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self._socket.settimeout(1)
-            self._socket.connect((self._ip, self._port))
+            if self._udp:
+                self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            else:
+                self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self._socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                self._socket.settimeout(1)
+                self._socket.connect((self._ip, self._port))
             self._debug('_ensure_connected:    ...success')
             return True
         except socket.error:
@@ -127,9 +131,8 @@ class Client(object):
             0 is a special value which means "all channels".
 
         pixels: A list of 3-tuples representing rgb colors.
-            Each value in the tuple should be in the range 0-255 inclusive. 
-            For example: [(255, 255, 255), (0, 0, 0), (127, 0, 0)]
-            Floats will be rounded down to integers.
+            Each value in the tuple should be in the range 0.0-1.0 inclusive.
+            For example: [(1, 1, 1), (0, 0, 0), (0.5, 0, 0)]
             Values outside the legal range will be clamped.
 
         Will establish a connection to the server as needed.
@@ -149,22 +152,26 @@ class Client(object):
             return False
 
         # build OPC message
-        command = SET_PIXEL_COLOURS
-        header = struct.pack('>BBH', channel, SET_PIXEL_COLOURS, len(pixels)*3)
-        pieces = [struct.pack(
-                      'BBB',
-                      min(255, max(0, int(r))),
-                      min(255, max(0, int(g))),
-                      min(255, max(0, int(b)))
-                  ) for r, g, b in pixels]
+        len_hi_byte = int(len(pixels)*3 / 256)
+        len_lo_byte = (len(pixels)*3) % 256
+        header = chr(channel) + chr(0) + chr(len_hi_byte) + chr(len_lo_byte)
+        pieces = [header]
+        for r, g, b in pixels:
+            r = min(255, max(0, int(r ** self._gamma[0] * 255)))
+            g = min(255, max(0, int(g ** self._gamma[1] * 255)))
+            b = min(255, max(0, int(b ** self._gamma[2] * 255)))
+            pieces.append(chr(r) + chr(g) + chr(b))
         if bytes is str:
-            message = header + ''.join(pieces)
+            message = ''.join(pieces)
         else:
-            message = header + b''.join(pieces)
+            message = bytes(map(ord, ''.join(pieces)))
 
         self._debug('put_pixels: sending pixels to server')
         try:
-            self._socket.send(message)
+            if self._udp:
+                self._socket.sendto(message, (self._ip, self._port))
+            else:
+                self._socket.send(message)
         except socket.error:
             self._debug('put_pixels: connection lost.  could not send pixels.')
             self._socket = None
